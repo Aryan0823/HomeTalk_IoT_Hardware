@@ -7,7 +7,7 @@
 #include <time.h>
 
 // DHT22 configuration
-#define DHTPIN 5
+#define DHTPIN 12
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -30,9 +30,9 @@ IPAddress gateway(192, 168, 0, 1);
 IPAddress subnet(255, 255, 255, 0);
 
 // Button and LED pins
-const int buttonPin = 4;
-const int ledPin = 21;
-
+const int buttonPin = 14;
+const int ledPin = 27;
+const int LED2 = 26;
 // NTP Server for time synchronization
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 19800;  // GMT+5:30 for IST
@@ -49,6 +49,7 @@ void setup() {
   delay(10);
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(ledPin, OUTPUT);
+  pinMode(LED2, OUTPUT);
   Serial.println("Startup");
 
   dht.begin();
@@ -81,37 +82,131 @@ void setup() {
   handleRequests();
 }
 
+unsigned long previousMillisStatusCheck = 0; // Store the last time device status was checked
+const long intervalStatusCheck = 1000; // Interval for device status check (1 second)
+
+unsigned long previousMillisDataCheck = 0; // Store the last time data was sent
+const long intervalDataCheck = 60000; // Interval for data check (1 minute)
+
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(ledPin, LOW);
-    
-    float humidity = dht.readHumidity();
-    float temperature = dht.readTemperature();
+  unsigned long currentMillis = millis();
 
-    if (isnan(humidity) || isnan(temperature)) {
-      Serial.println("Failed to read from DHT sensor!");
-    } else {
-      Serial.printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
-      sendToFirestore(temperature, humidity);
-    }
-  } else if (WiFi.getMode() == WIFI_AP) {
-    blinkLED();
-  } else {
-    digitalWrite(ledPin, HIGH);
-  }
-
+  // Check for button press to clear EEPROM
   if (digitalRead(buttonPin) == LOW) {
     Serial.println("Button pressed! Clearing EEPROM...");
     clearEEPROM();
+    blinkLED(); // Visual feedback that EEPROM was cleared
     ESP.restart();
   }
 
-  server.handleClient();
+  // Check device status every second if we have valid credentials
+  if (currentMillis - previousMillisStatusCheck >= intervalStatusCheck) {
+    previousMillisStatusCheck = currentMillis;
+    if (hasValidCredentials()) {
+      checkDeviceStatus();
+    }
+  }
 
-  delay(60000); // Wait for 1 minute before next reading
+  // Check and send data every minute if WiFi is connected and we have valid credentials
+  if (WiFi.status() == WL_CONNECTED && hasValidCredentials()) {
+    if (currentMillis - previousMillisDataCheck >= intervalDataCheck) {
+      previousMillisDataCheck = currentMillis;
+
+      float humidity = dht.readHumidity();
+      float temperature = dht.readTemperature();
+
+      if (isnan(humidity) || isnan(temperature)) {
+        Serial.println("Failed to read from DHT sensor!");
+      } else {
+        Serial.printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
+        sendToFirestore(temperature, humidity);
+      }
+    }
+    digitalWrite(ledPin, LOW); // Turn off LED when connected
+  } else {
+    digitalWrite(ledPin, HIGH); // Turn on LED when not connected or no valid credentials
+  }
+
+  server.handleClient();
+}
+
+bool hasValidCredentials() {
+  return (uid.length() > 0 && category.length() > 0 && deviceName.length() > 0);
+}
+
+// Add this function for visual feedback
+void blinkLED() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(100);
+    digitalWrite(ledPin, LOW);
+    delay(100);
+  }
+}
+
+void checkDeviceStatus() {
+  if (!hasValidCredentials()) {
+    Serial.println("No valid credentials. Skipping device status check.");
+    return;
+  }
+
+  String documentPath = "Data/" + uid + "/" + category + "/" + deviceName;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" FIREBASE_PROJECT_ID "/databases/(default)/documents/" + documentPath;
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  String idToken = getFirebaseToken();
+  if (idToken.length() < 100) {
+    Serial.println("Invalid Firebase ID token. Length: " + String(idToken.length()));
+    return;
+  }
+
+  http.addHeader("Authorization", "Bearer " + idToken);
+
+  int httpResponseCode = http.GET();
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("HTTP Response code: " + String(httpResponseCode));
+    Serial.println("Response body: " + response);
+
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, response);
+    if (error) {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    // Accessing the deviceStatus field directly
+    String deviceStatus = doc["fields"]["deviceStatus"]["stringValue"];
+    Serial.println("Device Status: " + deviceStatus);
+
+    if (deviceStatus == "ON") {
+      digitalWrite(LED2, HIGH); // Turn LED2 on
+      Serial.println("LED2 turned on");
+    } else if (deviceStatus == "OFF") {
+      digitalWrite(LED2, LOW); // Turn LED2 off
+      Serial.println("LED2 turned off");
+    } else {
+      Serial.println("Invalid device status");
+    }
+  } else {
+    Serial.print("Error code: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
 }
 
 void sendToFirestore(float temperature, float humidity) {
+  
+  if (!hasValidCredentials()) {
+    Serial.println("No valid credentials. Skipping data send to Firestore.");
+    return;
+  }
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)){
     Serial.println("Failed to obtain time");
@@ -356,12 +451,7 @@ void clearEEPROM() {
   Serial.println("EEPROM cleared");
 }
 
-void blinkLED() {
-  digitalWrite(ledPin, HIGH);
-  delay(500);
-  digitalWrite(ledPin, LOW);
-  delay(500);
-}
+
 
 void printLocalTime() {
   struct tm timeinfo;
